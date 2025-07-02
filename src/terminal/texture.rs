@@ -110,7 +110,6 @@ impl GlyphAtlas {
         }
     }
 
-    // ADD THIS METHOD TO FIX THE ERROR
     pub fn bind_group_layout(&self) -> &BindGroupLayout {
         &self.bind_group_layout
     }
@@ -125,6 +124,8 @@ impl GlyphAtlas {
         key: GlyphKey,
         image: &SwashImage,
     ) -> Result<(u32, u32, u32, u32)> {
+        println!("Adding glyph: {:?} {}x{}", key, image.placement.width, image.placement.height);
+        
         if let Some(rect) = self.cache.get(&key) {
             return Ok(*rect);
         }

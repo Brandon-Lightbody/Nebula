@@ -110,17 +110,20 @@ impl TerminalApp {
                 font_system: terminal.font_system,
                 buffer: terminal.buffer,
                 text_content: terminal.text_content,
+                last_text: String::from("Nebula\n$ "), // Track last text for changes
                 glyph_atlas,
                 swash_cache: cosmic_text::SwashCache::new(),
                 gpu_resources,
                 start_time,
                 last_frame_time,
                 focused: true,
-                dirty: true,
-                cursor_x: 16.0, // After "$ " (2 chars * 8px)
-                cursor_y: 20.0,  // First line
+                shared_dirty: terminal.dirty.clone(),
+                local_dirty: true,
+                cursor_x: terminal.cursor_x.clone(),
+                cursor_y: terminal.cursor_y.clone(),
                 cursor_visible: true,
-                last_text: String::from("Nebula\n$ "), // Track last text for changes
+                cursor_blink: true,
+                last_blink: Instant::now(),
             };
 
             let mut app = TerminalApp::new(
@@ -190,6 +193,7 @@ impl winit::application::ApplicationHandler for TerminalApp {
                     }
                 }
                 window.window.request_redraw();
+                self.state.local_dirty = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.state.focused {
@@ -219,19 +223,32 @@ impl winit::application::ApplicationHandler for TerminalApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Check if shared dirty flag was set by other threads
+        if *self.state.shared_dirty.lock().unwrap() {
+            self.state.local_dirty = true;
+            *self.state.shared_dirty.lock().unwrap() = false;
+        }
+        
+        // Check for text content changes
         let mut text_changed = false;
         if let Ok(text) = self.state.text_content.lock() {
             if *text != self.state.last_text {
                 self.state.last_text = text.clone();
                 text_changed = true;
+                self.state.local_dirty = true;
             }
         }
         
-        if text_changed {
-            self.state.dirty = true;
+        // Handle cursor blinking
+        let now = Instant::now();
+        if now.duration_since(self.state.last_blink).as_millis() > 500 {
+            self.state.cursor_blink = !self.state.cursor_blink;
+            self.state.last_blink = now;
+            self.state.local_dirty = true;
         }
         
-        if self.state.dirty {
+        // Request redraw if needed
+        if self.state.local_dirty {
             if let Some(window) = &self.window {
                 window.window.request_redraw();
             }

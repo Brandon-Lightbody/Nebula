@@ -91,6 +91,10 @@ pub fn render_frame(
                 }
             }
 
+            // Get cursor position from state
+            let cursor_x = *state.cursor_x.lock().unwrap();
+            let cursor_y = *state.cursor_y.lock().unwrap();
+
             // Render cursor
             let elapsed = state.start_time.elapsed().as_secs_f32();
             let cursor_blink = (elapsed * 2.0).sin() > 0.0;
@@ -98,10 +102,10 @@ pub fn render_frame(
                 let cursor_width = 8.0;
                 let cursor_height = 20.0;
                 
-                let left = (state.cursor_x / screen_width) * 2.0 - 1.0;
-                let right = ((state.cursor_x + cursor_width) / screen_width) * 2.0 - 1.0;
-                let top = 1.0 - (state.cursor_y / screen_height) * 2.0;
-                let bottom = 1.0 - ((state.cursor_y + cursor_height) / screen_height) * 2.0;
+                let left = (cursor_x / screen_width) * 2.0 - 1.0;
+                let right = ((cursor_x + cursor_width) / screen_width) * 2.0 - 1.0;
+                let top = 1.0 - (cursor_y / screen_height) * 2.0;
+                let bottom = 1.0 - ((cursor_y + cursor_height) / screen_height) * 2.0;
                 
                 verts.push([left, top, -1.0, -1.0]);
                 verts.push([right, top, -1.0, -1.0]);
@@ -162,5 +166,5 @@ pub fn render_frame(
     queue.submit(Some(encoder.finish()));
     output.present();
     
-    state.dirty = false;
+    state.local_dirty = false;
 }

@@ -5,13 +5,342 @@ use std::{
     io::{Read, Write},
     sync::{Arc, Mutex},
     thread,
+    collections::VecDeque,
 };
-use crate::terminal::config::{FONT_SIZE, LINE_HEIGHT};
+use vte::{Params, Perform};
+
+pub const FONT_SIZE: f32 = 14.0;
+pub const LINE_HEIGHT: f32 = 20.0;
+pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_ROWS: u16 = 24;
+
+#[derive(Debug, Clone)]
+struct TerminalCell {
+    character: char,
+    // Add attributes later: bold, italic, color, etc.
+}
+
+impl Default for TerminalCell {
+    fn default() -> Self {
+        Self { character: ' ' }
+    }
+}
+
+struct TerminalGrid {
+    rows: usize,
+    cols: usize,
+    cells: Vec<Vec<TerminalCell>>,
+    cursor_x: usize,
+    cursor_y: usize,
+    scrollback: VecDeque<String>,
+    scroll_offset: usize,
+    dirty: bool,
+}
+
+impl TerminalGrid {
+    fn new(rows: usize, cols: usize) -> Self {
+        let mut cells = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row = Vec::with_capacity(cols);
+            for _ in 0..cols {
+                row.push(TerminalCell::default());
+            }
+            cells.push(row);
+        }
+        
+        Self {
+            rows,
+            cols,
+            cells,
+            cursor_x: 0,
+            cursor_y: 0,
+            scrollback: VecDeque::new(),
+            scroll_offset: 0,
+            dirty: true,
+        }
+    }
+
+    fn clear_screen(&mut self) {
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                self.cells[row][col] = TerminalCell::default();
+            }
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.dirty = true;
+    }
+
+    fn clear_line(&mut self, from: usize) {
+        let row = self.cursor_y;
+        if row < self.rows {
+            for col in from..self.cols {
+                self.cells[row][col] = TerminalCell::default();
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn newline(&mut self) {
+        if self.cursor_y == self.rows - 1 {
+            self.scroll_up();
+        } else {
+            self.cursor_y += 1;
+        }
+        self.cursor_x = 0;
+        self.dirty = true;
+    }
+
+    fn carriage_return(&mut self) {
+        self.cursor_x = 0;
+        self.dirty = true;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_x > 0 {
+            self.cursor_x -= 1;
+            self.cells[self.cursor_y][self.cursor_x] = TerminalCell::default();
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        // Collect top line as string
+        let top_line: String = self.cells[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect();
+        self.scrollback.push_back(top_line);
+        
+        // Shift lines up
+        for row in 0..self.rows - 1 {
+            for col in 0..self.cols {
+                self.cells[row][col] = self.cells[row + 1][col].clone();
+            }
+        }
+        
+        // Clear bottom line
+        for col in 0..self.cols {
+            self.cells[self.rows - 1][col] = TerminalCell::default();
+        }
+        self.dirty = true;
+    }
+
+    fn scroll_down(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset -= 1;
+            if let Some(bottom_line) = self.scrollback.pop_back() {
+                // Shift lines down
+                for row in (1..self.rows).rev() {
+                    for col in 0..self.cols {
+                        self.cells[row][col] = self.cells[row - 1][col].clone();
+                    }
+                }
+                
+                // Set top line from scrollback
+                for (col, c) in bottom_line.chars().enumerate().take(self.cols) {
+                    self.cells[0][col] = TerminalCell { character: c };
+                }
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn move_cursor(&mut self, x: usize, y: usize) {
+        self.cursor_x = x.min(self.cols - 1);
+        self.cursor_y = y.min(self.rows - 1);
+        self.dirty = true;
+    }
+
+    fn move_cursor_relative(&mut self, dx: i32, dy: i32) {
+        let new_x = (self.cursor_x as i32 + dx).max(0) as usize;
+        let new_y = (self.cursor_y as i32 + dy).max(0) as usize;
+        self.move_cursor(new_x, new_y);
+    }
+
+    fn print_char(&mut self, c: char) {
+        if self.cursor_y < self.rows && self.cursor_x < self.cols {
+            self.cells[self.cursor_y][self.cursor_x] = TerminalCell { character: c };
+            self.cursor_x += 1;
+            self.dirty = true;
+        }
+        
+        if self.cursor_x >= self.cols {
+            self.carriage_return();
+            self.newline();
+        }
+    }
+
+    fn print_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.print_char(c);
+        }
+    }
+
+    fn to_string(&self) -> String {
+        let mut output = String::new();
+        
+        // Add scrollback lines
+        for line in self.scrollback.iter().skip(self.scroll_offset) {
+            output.push_str(line);
+            output.push('\n');
+        }
+        
+        // Add current screen content
+        for row in 0..self.rows {
+            let line: String = self.cells[row]
+                .iter()
+                .map(|cell| cell.character)
+                .collect();
+            output.push_str(&line);
+            if row < self.rows - 1 {
+                output.push('\n');
+            }
+        }
+        
+        output
+    }
+}
+
+struct TerminalPerformer {
+    grid: TerminalGrid,
+}
+
+impl TerminalPerformer {
+    fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            grid: TerminalGrid::new(rows, cols),
+        }
+    }
+}
+
+impl Perform for TerminalPerformer {
+    fn print(&mut self, c: char) {
+        self.grid.print_char(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            0x08 => self.grid.backspace(),    // Backspace
+            0x09 => self.grid.print_str("    "), // Tab (4 spaces)
+            0x0A => self.grid.newline(),      // Line feed
+            0x0D => self.grid.carriage_return(), // Carriage return
+            0x0C => self.grid.clear_screen(), // Form feed (clear screen)
+            _ => (),
+        }
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        let get_param = |index: usize| -> usize {
+            params.into_iter().nth(index)
+                .and_then(|p| p.first().copied())
+                .unwrap_or(1) as usize
+        };
+
+        match action {
+            // Cursor movement
+            'A' => self.grid.move_cursor_relative(0, get_param(0) as i32), // Up
+            'B' => self.grid.move_cursor_relative(0, get_param(0) as i32),   // Down
+            'C' => self.grid.move_cursor_relative(get_param(0) as i32, 0),   // Right
+            'D' => self.grid.move_cursor_relative(-(get_param(0) as i32), 0), // Left
+            'H' | 'f' => { // Cursor position
+                let row = get_param(0).saturating_sub(1);
+                let col = get_param(1).saturating_sub(1);
+                self.grid.move_cursor(col, row);
+            },
+            
+            // Screen clearing
+            'J' => match get_param(0) {
+                0 => { // Clear from cursor to end of screen
+                    self.grid.clear_line(self.grid.cursor_x);
+                    for y in self.grid.cursor_y + 1..self.grid.rows {
+                        for x in 0..self.grid.cols {
+                            self.grid.cells[y][x] = TerminalCell::default();
+                        }
+                    }
+                },
+                1 => { // Clear from beginning to cursor
+                    for y in 0..self.grid.cursor_y {
+                        for x in 0..self.grid.cols {
+                            self.grid.cells[y][x] = TerminalCell::default();
+                        }
+                    }
+                    self.grid.clear_line(0);
+                },
+                2 => self.grid.clear_screen(), // Clear entire screen
+                _ => (),
+            },
+            'K' => match get_param(0) {
+                0 => self.grid.clear_line(self.grid.cursor_x), // Clear to end of line
+                1 => self.grid.clear_line(0), // Clear from beginning of line
+                2 => { // Clear entire line
+                    for x in 0..self.grid.cols {
+                        self.grid.cells[self.grid.cursor_y][x] = TerminalCell::default();
+                    }
+                },
+                _ => (),
+            },
+            
+            // Scrolling
+            'S' => { // Scroll up
+                for _ in 0..get_param(0) {
+                    self.grid.scroll_up();
+                }
+            },
+            'T' => { // Scroll down
+                for _ in 0..get_param(0) {
+                    self.grid.scroll_down();
+                }
+            },
+            
+            // Character deletion
+            'P' => { // Delete character
+                let row = self.grid.cursor_y;
+                let start = self.grid.cursor_x;
+                let count = get_param(0);
+                let end = (start + count).min(self.grid.cols);
+                
+                // Shift characters left
+                for x in start..(self.grid.cols - count) {
+                    if x + count < self.grid.cols {
+                        self.grid.cells[row][x] = self.grid.cells[row][x + count].clone();
+                    }
+                }
+                
+                // Clear remaining characters
+                for x in (self.grid.cols - count)..self.grid.cols {
+                    self.grid.cells[row][x] = TerminalCell::default();
+                }
+            },
+            
+            _ => (),
+        }
+        self.grid.dirty = true;
+    }
+
+    // Required trait methods
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn put(&mut self, _byte: u8) {}
+    fn unhook(&mut self) {}
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+}
 
 pub struct Terminal {
     pub font_system: Arc<Mutex<FontSystem>>,
     pub buffer: Arc<Mutex<Buffer>>,
     pub text_content: Arc<Mutex<String>>,
+    pub cursor_x: Arc<Mutex<f32>>,
+    pub cursor_y: Arc<Mutex<f32>>,
+    pub dirty: Arc<Mutex<bool>>,
+    pub cols: Arc<Mutex<usize>>,
+    pub rows: Arc<Mutex<usize>>,
 }
 
 impl Terminal {
@@ -19,9 +348,11 @@ impl Terminal {
         let font_system = Arc::new(Mutex::new(FontSystem::new()));
         let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
         let mut buffer = Buffer::new(&mut font_system.lock().unwrap(), metrics);
+        
+        let initial_text = "Nebula Terminal\n$ ";
         buffer.set_text(
             &mut font_system.lock().unwrap(), 
-            "Nebula\n$ ", 
+            initial_text, 
             &Attrs::new(), 
             Shaping::Advanced
         );
@@ -36,20 +367,30 @@ impl Terminal {
             );
         }
 
-        let text_content = Arc::new(Mutex::new(String::from("Nebula\n$ ")));
+        let text_content = Arc::new(Mutex::new(String::from(initial_text)));
+        let cursor_x = Arc::new(Mutex::new(16.0)); // After "$ " (2 chars * 8px)
+        let cursor_y = Arc::new(Mutex::new(20.0)); // First line
+        let dirty = Arc::new(Mutex::new(true));
+        let cols = Arc::new(Mutex::new(DEFAULT_COLS as usize));
+        let rows = Arc::new(Mutex::new(DEFAULT_ROWS as usize));
         
         Self {
             font_system,
             buffer,
             text_content,
+            cursor_x,
+            cursor_y,
+            dirty,
+            cols,
+            rows,
         }
     }
 
     pub fn spawn_pty(&self) -> Result<(Arc<Mutex<dyn Write + Send>>, Arc<Mutex<Box<dyn Child + Send>>>)> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: DEFAULT_ROWS,
+            cols: DEFAULT_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -67,7 +408,7 @@ impl Terminal {
             }
         }
 
-        // Create a simple command that stays open
+        // Create a command
         let mut cmd = if cfg!(target_os = "windows") {
             let mut cmd = CommandBuilder::new("cmd.exe");
             cmd.arg("/K");
@@ -78,7 +419,7 @@ impl Terminal {
             cmd
         };
         
-        // Use minimal environment
+        // Set minimal environment
         cmd.env_clear();
         if cfg!(target_os = "windows") {
             cmd.env("SystemRoot", std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()));
@@ -95,125 +436,81 @@ impl Terminal {
         println!("Child process spawned: {:?}", child);
         
         let child_ref = Arc::new(Mutex::new(child));
-        
-        // Keep the master PTY alive by storing it in an Arc
         let master = pair.master;
         let master_ref = Arc::new(Mutex::new(master));
-        
-        // Clone the reader and writer from the master
         let reader = master_ref.lock().unwrap().try_clone_reader()?;
         let writer = master_ref.lock().unwrap().take_writer()?;
         
+        // Clone shared state
         let buffer_clone = Arc::clone(&self.buffer);
         let font_system_clone = Arc::clone(&self.font_system);
         let text_content_clone = Arc::clone(&self.text_content);
-        let child_clone = Arc::clone(&child_ref);
-        let master_clone = Arc::clone(&master_ref);
+        let cursor_x_clone = Arc::clone(&self.cursor_x);
+        let cursor_y_clone = Arc::clone(&self.cursor_y);
+        let dirty_clone = Arc::clone(&self.dirty);
+        let cols_clone = Arc::clone(&self.cols);
+        let rows_clone = Arc::clone(&self.rows);
         
         thread::spawn(move || {
             println!("PTY reader thread started");
             let mut reader = reader;
-            let mut buffer = [0; 1024];
+            let mut buffer = [0; 4096];
+            let mut parser = vte::Parser::new();
             
-            // Buffer to accumulate incomplete UTF-8 sequences
-            let mut utf8_buffer = Vec::new();
+            // Create performer with current dimensions
+            let cols = *cols_clone.lock().unwrap();
+            let rows = *rows_clone.lock().unwrap();
+            let mut performer = TerminalPerformer::new(rows, cols);
+            
+            // Initial prompt
+            performer.grid.print_str("Nebula Terminal\n$ ");
             
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         println!("PTY reader reached EOF");
-                        // Check why the process exited
-                        let mut child = child_clone.lock().unwrap();
-                        if let Ok(Some(exit_status)) = child.try_wait() {
-                            println!("Child process exited with status: {:?}", exit_status);
-                        } else {
-                            println!("Child process status unknown");
-                        }
                         break;
                     }
                     Ok(n) => {
                         let data = &buffer[..n];
                         
-                        // Print to console for debugging
-                        println!("PTY OUTPUT ({} bytes): {:?}", n, data);
-                        
-                        // Accumulate data into UTF-8 buffer
-                        utf8_buffer.extend_from_slice(data);
-                        
-                        // Try to convert to UTF-8
-                        match String::from_utf8(utf8_buffer.clone()) {
-                            Ok(valid_str) => {
-                                println!("PTY OUTPUT (str): {}", valid_str);
-                                
-                                let mut text = text_content_clone.lock().unwrap();
-                                text.push_str(&valid_str);
-                                
-                                if let Ok(mut buffer_lock) = buffer_clone.lock() {
-                                    if let Ok(mut fs) = font_system_clone.lock() {
-                                        buffer_lock.set_text(
-                                            &mut fs, 
-                                            &text, 
-                                            &Attrs::new(), 
-                                            Shaping::Advanced
-                                        );
-                                        buffer_lock.shape_until_scroll(&mut fs, true);
-                                        println!("Buffer updated with new text");
-                                    } else {
-                                        eprintln!("Failed to lock font system");
-                                    }
-                                } else {
-                                    eprintln!("Failed to lock buffer");
-                                }
-                                
-                                // Clear the buffer after successful conversion
-                                utf8_buffer.clear();
-                            }
-                            Err(e) => {
-                                let utf8_error = e.utf8_error();
-                                let valid_up_to = utf8_error.valid_up_to();
-                                
-                                if valid_up_to > 0 {
-                                    // Extract valid part
-                                    let valid_part = String::from_utf8_lossy(&utf8_buffer[..valid_up_to]).to_string();
-                                    println!("PTY OUTPUT (partial str): {}", valid_part);
-                                    
-                                    let mut text = text_content_clone.lock().unwrap();
-                                    text.push_str(&valid_part);
-                                    
-                                    if let Ok(mut buffer_lock) = buffer_clone.lock() {
-                                        if let Ok(mut fs) = font_system_clone.lock() {
-                                            buffer_lock.set_text(
-                                                &mut fs, 
-                                                &text, 
-                                                &Attrs::new(), 
-                                                Shaping::Advanced
-                                            );
-                                            buffer_lock.shape_until_scroll(&mut fs, true);
-                                            println!("Buffer updated with partial text");
-                                        }
-                                    }
-                                    
-                                    // Keep only the invalid part for next iteration
-                                    utf8_buffer = utf8_buffer[valid_up_to..].to_vec();
-                                }
-                                // If no valid part, keep the entire buffer for next read
-                            }
+                        // Process each byte through VTE parser
+                        for &byte in data {
+                            parser.advance(&mut performer, &[byte]);
                         }
+                        
+                        // Always update state after processing input
+        let new_text = performer.grid.to_string();
+        
+        // Update shared state
+        {
+            let mut text_lock = text_content_clone.lock().unwrap();
+            *text_lock = new_text.clone();
+        }
+        *cursor_x_clone.lock().unwrap() = performer.grid.cursor_x as f32 * 8.0;
+        *cursor_y_clone.lock().unwrap() = performer.grid.cursor_y as f32 * LINE_HEIGHT;
+        
+        {
+            let mut buffer_lock = buffer_clone.lock().unwrap();
+            if let Ok(mut fs) = font_system_clone.lock() {
+                buffer_lock.set_text(
+                    &mut fs, 
+                    &new_text, 
+                    &Attrs::new(), 
+                    Shaping::Advanced
+                );
+                buffer_lock.shape_until_scroll(&mut fs, true);
+            }
+        }
+        *dirty_clone.lock().unwrap() = true;
+        performer.grid.dirty = false;
                     }
                     Err(e) => {
                         eprintln!("PTY read error: {}", e);
-                        // Check why the process exited
-                        let mut child = child_clone.lock().unwrap();
-                        if let Ok(Some(exit_status)) = child.try_wait() {
-                            println!("Child process exited with status: {:?}", exit_status);
-                        }
                         break;
                     }
                 }
             }
-            
-            // Keep master_ref alive until the end of the thread
-            let _unused = master_clone.lock().unwrap();
             println!("PTY reader thread exiting");
         });
 

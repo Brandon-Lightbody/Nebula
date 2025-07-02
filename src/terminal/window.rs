@@ -1,9 +1,8 @@
 // src/terminal/window.rs
 use std::sync::Arc;
 use winit::{
-    dpi::LogicalSize,
     event_loop::ActiveEventLoop,
-    window::{Window, WindowAttributes, WindowLevel},
+    window::{Window, WindowAttributes},
 };
 use wgpu::{Instance, Surface, SurfaceConfiguration};
 
