@@ -124,14 +124,17 @@ impl GlyphAtlas {
         key: GlyphKey,
         image: &SwashImage,
     ) -> Result<(u32, u32, u32, u32)> {
-        println!("Adding glyph: {:?} {}x{}", key, image.placement.width, image.placement.height);
-        
         if let Some(rect) = self.cache.get(&key) {
             return Ok(*rect);
         }
 
         let width = image.placement.width;
         let height = image.placement.height;
+
+        // Skip zero-sized glyphs
+        if width == 0 || height == 0 {
+            return Err(anyhow!("Zero-sized glyph"));
+        }
 
         if self.current_x + width > self.atlas_size {
             self.current_x = 0;

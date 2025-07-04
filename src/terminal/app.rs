@@ -106,13 +106,15 @@ impl TerminalApp {
             let start_time = Instant::now();
             let last_frame_time = start_time;
 
+            let initial_text = terminal.text_content.lock().unwrap().clone();
+
             let state = TerminalState {
                 font_system: terminal.font_system,
                 buffer: terminal.buffer,
                 text_content: terminal.text_content,
-                last_text: String::from("Nebula\n$ "), // Track last text for changes
+                last_text: initial_text, // Track last text for changes
                 glyph_atlas,
-                swash_cache: cosmic_text::SwashCache::new(),
+                swash_cache: terminal.swash_cache,
                 gpu_resources,
                 start_time,
                 last_frame_time,
@@ -242,7 +244,7 @@ impl winit::application::ApplicationHandler for TerminalApp {
         // Handle cursor blinking
         let now = Instant::now();
         if now.duration_since(self.state.last_blink).as_millis() > 500 {
-            self.state.cursor_blink = !self.state.cursor_blink;
+            self.state.cursor_visible = !self.state.cursor_visible;
             self.state.last_blink = now;
             self.state.local_dirty = true;
         }

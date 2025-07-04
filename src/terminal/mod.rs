@@ -24,7 +24,7 @@ pub struct TerminalState {
     pub text_content: Arc<Mutex<String>>,
     pub last_text: String,
     pub glyph_atlas: GlyphAtlas,
-    pub swash_cache: SwashCache,
+    pub swash_cache: Arc<Mutex<SwashCache>>,
     pub gpu_resources: GpuResources,
     pub start_time: Instant,
     pub last_frame_time: Instant,

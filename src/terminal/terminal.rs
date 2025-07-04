@@ -8,6 +8,8 @@ use std::{
     collections::VecDeque,
 };
 use vte::{Params, Perform};
+use crate::terminal::SwashCache;
+use cosmic_text::Family;
 
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 20.0;
@@ -165,6 +167,7 @@ impl TerminalGrid {
             self.dirty = true;
         }
         
+        // Only wrap when at column boundary
         if self.cursor_x >= self.cols {
             self.carriage_return();
             self.newline();
@@ -204,12 +207,14 @@ impl TerminalGrid {
 
 struct TerminalPerformer {
     grid: TerminalGrid,
+    writer: Arc<Mutex<dyn Write + Send>>,  // Add writer for escape sequence responses
 }
 
 impl TerminalPerformer {
-    fn new(rows: usize, cols: usize) -> Self {
+    fn new(rows: usize, cols: usize, writer: Arc<Mutex<dyn Write + Send>>) -> Self {
         Self {
             grid: TerminalGrid::new(rows, cols),
+            writer,
         }
     }
 }
@@ -245,7 +250,7 @@ impl Perform for TerminalPerformer {
 
         match action {
             // Cursor movement
-            'A' => self.grid.move_cursor_relative(0, get_param(0) as i32), // Up
+            'A' => self.grid.move_cursor_relative(0, -(get_param(0) as i32)), // Up
             'B' => self.grid.move_cursor_relative(0, get_param(0) as i32),   // Down
             'C' => self.grid.move_cursor_relative(get_param(0) as i32, 0),   // Right
             'D' => self.grid.move_cursor_relative(-(get_param(0) as i32), 0), // Left
@@ -319,9 +324,25 @@ impl Perform for TerminalPerformer {
                 }
             },
             
+            // Handle Device Status Report (DSR)
+            'n' => {
+                if get_param(0) == 6 {
+                    // Respond with cursor position report
+                    let response = format!(
+                        "\x1B[{};{}R",
+                        self.grid.cursor_y + 1,
+                        self.grid.cursor_x + 1
+                    );
+                    if let Ok(mut w) = self.writer.lock() {
+                        let _ = w.write_all(response.as_bytes());
+                        let _ = w.flush();
+                        println!("Responded to DSR: {}", response);
+                    }
+                }
+            }
+            
             _ => (),
         }
-        self.grid.dirty = true;
     }
 
     // Required trait methods
@@ -341,17 +362,21 @@ pub struct Terminal {
     pub dirty: Arc<Mutex<bool>>,
     pub cols: Arc<Mutex<usize>>,
     pub rows: Arc<Mutex<usize>>,
+    pub swash_cache: Arc<Mutex<SwashCache>>,
 }
 
 impl Terminal {
     pub fn new() -> Self {
-        let font_system = Arc::new(Mutex::new(FontSystem::new()));
+        let mut font_system = FontSystem::new();
+        // Load system fonts for proper rendering
+        font_system.db_mut().load_system_fonts();
+        
         let metrics = Metrics::new(FONT_SIZE, LINE_HEIGHT);
-        let mut buffer = Buffer::new(&mut font_system.lock().unwrap(), metrics);
+        let mut buffer = Buffer::new(&mut font_system, metrics);
         
         let initial_text = "Nebula Terminal\n$ ";
         buffer.set_text(
-            &mut font_system.lock().unwrap(), 
+            &mut font_system, 
             initial_text, 
             &Attrs::new(), 
             Shaping::Advanced
@@ -361,21 +386,23 @@ impl Terminal {
         {
             let mut buffer_lock = buffer.lock().unwrap();
             buffer_lock.set_size(
-                &mut font_system.lock().unwrap(),
+                &mut font_system,
                 Some(1600.0),
                 Some(900.0),
             );
         }
 
         let text_content = Arc::new(Mutex::new(String::from(initial_text)));
-        let cursor_x = Arc::new(Mutex::new(16.0)); // After "$ " (2 chars * 8px)
-        let cursor_y = Arc::new(Mutex::new(20.0)); // First line
+        // After "$ " (2 characters * FONT_SIZE) at line 1
+        let cursor_x = Arc::new(Mutex::new(2.0 * FONT_SIZE));
+        let cursor_y = Arc::new(Mutex::new(1.0 * LINE_HEIGHT));
         let dirty = Arc::new(Mutex::new(true));
         let cols = Arc::new(Mutex::new(DEFAULT_COLS as usize));
         let rows = Arc::new(Mutex::new(DEFAULT_ROWS as usize));
+        let swash_cache = Arc::new(Mutex::new(SwashCache::new()));
         
         Self {
-            font_system,
+            font_system: Arc::new(Mutex::new(font_system)),
             buffer,
             text_content,
             cursor_x,
@@ -383,138 +410,264 @@ impl Terminal {
             dirty,
             cols,
             rows,
+            swash_cache
         }
     }
 
     pub fn spawn_pty(&self) -> Result<(Arc<Mutex<dyn Write + Send>>, Arc<Mutex<Box<dyn Child + Send>>>)> {
-        let pty_system = NativePtySystem::default();
-        let pair = pty_system.openpty(PtySize {
-            rows: DEFAULT_ROWS,
-            cols: DEFAULT_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        
-        println!("PTY created successfully");
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system.openpty(PtySize {
+        rows: DEFAULT_ROWS,
+        cols: DEFAULT_COLS,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    
+    println!("PTY created successfully");
 
-        // For Unix systems, set raw mode
-        #[cfg(unix)]
-        {
-            use portable_pty::MasterPty;
-            if let Err(e) = pair.master.set_raw_mode() {
-                eprintln!("Failed to set PTY raw mode: {}", e);
-            } else {
-                println!("PTY raw mode enabled");
-            }
+    // For Unix systems, set raw mode
+    #[cfg(unix)]
+    {
+        use portable_pty::MasterPty;
+        if let Err(e) = pair.master.set_raw_mode() {
+            eprintln!("Failed to set PTY raw mode: {}", e);
+        } else {
+            println!("PTY raw mode enabled");
         }
+    }
 
-        // Create a command
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut cmd = CommandBuilder::new("cmd.exe");
-            cmd.arg("/K");
-            cmd
-        } else {
-            let mut cmd = CommandBuilder::new("bash");
-            cmd.arg("-i");
-            cmd
-        };
+    // Create a command with proper shell initialization
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.arg("/K");
+        cmd.env("PROMPT", "$G$S"); // Simplify prompt
+        cmd
+    } else {
+        let mut cmd = CommandBuilder::new("bash");
+        // Use --login for proper initialization
+        cmd.args(&["--login", "-i"]);
+        cmd
+    };
+    
+    // Set essential environment variables
+    //cmd.env_clear();
+    if cfg!(target_os = "windows") {
+        cmd.env("SystemRoot", std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()));
+        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+        cmd.env("COMSPEC", std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()));
+        cmd.env("TEMP", std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()));
+    } else {
+        cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
+        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("SHELL", std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()));
+        cmd.env("USER", std::env::var("USER").unwrap_or_default());
+        cmd.env("LANG", "en_US.UTF-8");
+    };
+    
+    println!("Spawning command: {:?}", cmd);
+    let child: Box<dyn Child + Send> = match pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Failed to spawn child process: {}", e);
+            return Err(e.into());
+        }
+    };
+    println!("Child process spawned: {:?}", child);
+    
+    let child_ref = Arc::new(Mutex::new(child));
+    let master = pair.master;
+    let master_ref = Arc::new(Mutex::new(master));
+    let reader = master_ref.lock().unwrap().try_clone_reader()?;
+    let writer = master_ref.lock().unwrap().take_writer()?;
+    
+    // Clone shared state
+    let buffer_clone = Arc::clone(&self.buffer);
+    let font_system_clone = Arc::clone(&self.font_system);
+    let text_content_clone = Arc::clone(&self.text_content);
+    let cursor_x_clone = Arc::clone(&self.cursor_x);
+    let cursor_y_clone = Arc::clone(&self.cursor_y);
+    let dirty_clone = Arc::clone(&self.dirty);
+    let cols_clone = Arc::clone(&self.cols);
+    let rows_clone = Arc::clone(&self.rows);
+    let swash_cache_clone = Arc::clone(&self.swash_cache);
+    
+    // Create inner references that can be cloned in the loop
+    let child_ref_inner = child_ref.clone();
+    let master_ref_inner = master_ref.clone();
+
+    // Create a writer for escape sequence responses
+    let writer_arc = Arc::new(Mutex::new(writer));
+    let response_writer = Arc::clone(&writer_arc);
+
+    thread::spawn(move || {
+        println!("PTY reader thread started");
+        let mut reader = reader;
+        let mut buffer = [0; 4096];
+        let mut parser = vte::Parser::new();
         
-        // Set minimal environment
-        cmd.env_clear();
-        if cfg!(target_os = "windows") {
-            cmd.env("SystemRoot", std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()));
-            cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-            cmd.env("COMSPEC", std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()));
-        } else {
-            cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-            cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
-            cmd.env("TERM", "xterm-256color");
-        };
+        let cols = *cols_clone.lock().unwrap();
+        let rows = *rows_clone.lock().unwrap();
+        let mut performer = TerminalPerformer::new(rows, cols, response_writer);
         
-        println!("Spawning command: {:?}", cmd);
-        let child: Box<dyn Child + Send> = pair.slave.spawn_command(cmd)?;
-        println!("Child process spawned: {:?}", child);
+        performer.grid.print_str("Nebula Terminal\n$ ");
         
-        let child_ref = Arc::new(Mutex::new(child));
-        let master = pair.master;
-        let master_ref = Arc::new(Mutex::new(master));
-        let reader = master_ref.lock().unwrap().try_clone_reader()?;
-        let writer = master_ref.lock().unwrap().take_writer()?;
-        
-        // Clone shared state
-        let buffer_clone = Arc::clone(&self.buffer);
-        let font_system_clone = Arc::clone(&self.font_system);
-        let text_content_clone = Arc::clone(&self.text_content);
-        let cursor_x_clone = Arc::clone(&self.cursor_x);
-        let cursor_y_clone = Arc::clone(&self.cursor_y);
-        let dirty_clone = Arc::clone(&self.dirty);
-        let cols_clone = Arc::clone(&self.cols);
-        let rows_clone = Arc::clone(&self.rows);
-        
-        thread::spawn(move || {
-            println!("PTY reader thread started");
-            let mut reader = reader;
-            let mut buffer = [0; 4096];
-            let mut parser = vte::Parser::new();
-            
-            // Create performer with current dimensions
-            let cols = *cols_clone.lock().unwrap();
-            let rows = *rows_clone.lock().unwrap();
-            let mut performer = TerminalPerformer::new(rows, cols);
-            
-            // Initial prompt
-            performer.grid.print_str("Nebula Terminal\n$ ");
-            
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        println!("PTY reader reached EOF");
-                        break;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    println!("Shell exited, restarting...");
+                    performer.grid.print_str("\n[Shell exited, restarting...]\n");
+                    
+                    let new_pair = match pty_system.openpty(PtySize {
+                        rows: DEFAULT_ROWS,
+                        cols: DEFAULT_COLS,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            performer.grid.print_str(&format!("\n[Failed to create PTY: {}]\n", e));
+                            break;
+                        }
+                    };
+                    
+                    let mut cmd = if cfg!(target_os = "windows") {
+                        let mut cmd = CommandBuilder::new("cmd.exe");
+                        cmd.arg("/K");
+                        cmd.env("PROMPT", "$G$S");
+                        cmd
+                    } else {
+                        let mut cmd = CommandBuilder::new("bash");
+                        cmd.args(&["--login", "-i"]);
+                        cmd
+                    };
+                    
+                    cmd.env_clear();
+                    if cfg!(target_os = "windows") {
+                        cmd.env("SystemRoot", std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()));
+                        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+                        cmd.env("COMSPEC", std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string()));
+                        cmd.env("TEMP", std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()));
+                    } else {
+                        cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
+                        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+                        cmd.env("TERM", "xterm-256color");
+                        cmd.env("SHELL", std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()));
+                        cmd.env("USER", std::env::var("USER").unwrap_or_default());
+                        cmd.env("LANG", "en_US.UTF-8");
+                    };
+                    
+                    let new_child = match new_pair.slave.spawn_command(cmd) {
+                        Ok(child) => child,
+                        Err(e) => {
+                            performer.grid.print_str(&format!("\n[Failed to spawn shell: {}]\n", e));
+                            break;
+                        }
+                    };
+                    
+                    // Update references using inner clones
+                    *child_ref_inner.lock().unwrap() = new_child;
+                    *master_ref_inner.lock().unwrap() = new_pair.master;
+                    
+                    // Recreate reader from new master
+                    reader = match master_ref.lock().unwrap().try_clone_reader() {
+                        Ok(reader) => reader,
+                        Err(e) => {
+                            performer.grid.print_str(&format!("\n[Failed to clone reader: {}]\n", e));
+                            break;
+                        }
+                    };
+                    
+                    // Reset terminal state
+                    performer.grid.clear_screen();
+                    performer.grid.cursor_x = 0;
+                    performer.grid.cursor_y = 0;
+                    performer.grid.scrollback.clear();
+                    performer.grid.scroll_offset = 0;
+                    performer.grid.dirty = true;
+                    
+                    // Print fresh prompt
+                    performer.grid.print_str("Nebula Terminal\n$ ");
+                    
+                    // Update state to reflect new prompt
+                    let new_text = performer.grid.to_string();
+                    let cursor_x = performer.grid.cursor_x as f32 * FONT_SIZE;
+                    let cursor_y = performer.grid.cursor_y as f32 * LINE_HEIGHT;
+                    
+                    {
+                        let mut text_lock = text_content_clone.lock().unwrap();
+                        *text_lock = new_text.clone();
                     }
-                    Ok(n) => {
-                        let data = &buffer[..n];
+                    
+                    {
+                        let mut buffer_lock = buffer_clone.lock().unwrap();
+                        if let Ok(mut fs) = font_system_clone.lock() {
+                            buffer_lock.set_text(
+                                &mut fs, 
+                                &new_text, 
+                                &Attrs::new().family(Family::Monospace),
+                                Shaping::Advanced
+                            );
+                            buffer_lock.shape_until_scroll(&mut fs, true);
+                        }
+                    }
+                    
+                    *cursor_x_clone.lock().unwrap() = cursor_x;
+                    *cursor_y_clone.lock().unwrap() = cursor_y;
+                    *dirty_clone.lock().unwrap() = true;
+                }
+                Ok(n) => {
+                    let data = &buffer[..n];
+                    println!("PTY received {} bytes: {:?}", n, data);
+                    
+                    for &byte in data {
+                        parser.advance(&mut performer, &[byte]);
+                    }
+                    
+                    if performer.grid.dirty {
+                        println!("Grid dirty - cursor: ({}, {})", 
+                            performer.grid.cursor_x, performer.grid.cursor_y);
+                        println!("Grid content:\n{}", performer.grid.to_string());
                         
-                        // Process each byte through VTE parser
-                        for &byte in data {
-                            parser.advance(&mut performer, &[byte]);
+                        let new_text = performer.grid.to_string();
+                        let cursor_x = performer.grid.cursor_x as f32 * FONT_SIZE;
+                        let cursor_y = performer.grid.cursor_y as f32 * LINE_HEIGHT;
+                        
+                        {
+                            let mut text_lock = text_content_clone.lock().unwrap();
+                            *text_lock = new_text.clone();
                         }
                         
-                        // Always update state after processing input
-        let new_text = performer.grid.to_string();
-        
-        // Update shared state
-        {
-            let mut text_lock = text_content_clone.lock().unwrap();
-            *text_lock = new_text.clone();
-        }
-        *cursor_x_clone.lock().unwrap() = performer.grid.cursor_x as f32 * 8.0;
-        *cursor_y_clone.lock().unwrap() = performer.grid.cursor_y as f32 * LINE_HEIGHT;
-        
-        {
-            let mut buffer_lock = buffer_clone.lock().unwrap();
-            if let Ok(mut fs) = font_system_clone.lock() {
-                buffer_lock.set_text(
-                    &mut fs, 
-                    &new_text, 
-                    &Attrs::new(), 
-                    Shaping::Advanced
-                );
-                buffer_lock.shape_until_scroll(&mut fs, true);
-            }
-        }
-        *dirty_clone.lock().unwrap() = true;
-        performer.grid.dirty = false;
-                    }
-                    Err(e) => {
-                        eprintln!("PTY read error: {}", e);
-                        break;
+                        {
+                            let mut buffer_lock = buffer_clone.lock().unwrap();
+                            if let Ok(mut fs) = font_system_clone.lock() {
+                                buffer_lock.set_text(
+                                    &mut fs, 
+                                    &new_text, 
+                                    &Attrs::new(), 
+                                    Shaping::Advanced
+                                );
+                                buffer_lock.shape_until_scroll(&mut fs, true);
+                            }
+                        }
+                        
+                        *cursor_x_clone.lock().unwrap() = cursor_x;
+                        *cursor_y_clone.lock().unwrap() = cursor_y;
+                        *dirty_clone.lock().unwrap() = true;
+                        performer.grid.dirty = false;
                     }
                 }
+                Err(e) => {
+                    eprintln!("PTY read error: {}", e);
+                    break;
+                }
             }
-            println!("PTY reader thread exiting");
-        });
+        }
+        println!("PTY reader thread exiting");
+    });
 
-        println!("Returning PTY writer and child reference");
-        Ok((Arc::new(Mutex::new(writer)), child_ref))
-    }
+    println!("Returning PTY writer and child reference");
+    Ok((writer_arc, child_ref))
+}
 }
